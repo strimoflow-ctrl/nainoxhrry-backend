@@ -15,10 +15,35 @@ if (!fs.existsSync(CACHE_DIR)) {
 
 const httpsAgent = new https.Agent({
   keepAlive: true,
-  maxSockets: 50,
-  maxFreeSockets: 10,
-  timeout: 30000
+  maxSockets: 60,
+  maxFreeSockets: 20,
+  timeout: 45000
 });
+
+// Ultra-fast in-memory cache and in-flight request deduplication
+const MEMORY_CACHE = new Map();
+const INFLIGHT_REQUESTS = new Map();
+
+function getCachedResponse(key) {
+  const item = MEMORY_CACHE.get(key);
+  if (!item) return null;
+  if (Date.now() > item.expiresAt) {
+    MEMORY_CACHE.delete(key);
+    return null;
+  }
+  return item;
+}
+
+function setCachedResponse(key, data, ttlMs = 1800000) {
+  if (MEMORY_CACHE.size > 1200) {
+    const firstKey = MEMORY_CACHE.keys().next().value;
+    MEMORY_CACHE.delete(firstKey);
+  }
+  MEMORY_CACHE.set(key, {
+    ...data,
+    expiresAt: Date.now() + ttlMs
+  });
+}
 
 // Token pool with automatic fallback
 let tokenPool = [
@@ -66,7 +91,7 @@ function fetchUpstream(upstreamPath) {
         'Authorization': 'Bearer ' + token
       },
       agent: httpsAgent,
-      timeout: 15000
+      timeout: 35000
     }, (res) => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
@@ -451,39 +476,72 @@ const server = http.createServer(async (req, res) => {
       } else if (pathname.startsWith('/tbv2/series')) {
         targetPath = '/testbook/series';
       }
+      // 1. Check ultra-fast RAM cache first (0.01ms response)
+      const ramCached = getCachedResponse(targetPath);
+      if (ramCached) {
+        res.writeHead(200, {
+          'Content-Type': ramCached.contentType || 'application/json; charset=utf-8',
+          'Content-Length': Buffer.byteLength(ramCached.body),
+          'X-Cache': 'HIT-RAM'
+        });
+        return res.end(ramCached.body);
+      }
+
       const safeKey = targetPath.replace(/[^a-zA-Z0-9_-]/g, '_');
       const cacheKey = path.join(CACHE_DIR, `${safeKey}.json`);
 
       if (fs.existsSync(cacheKey)) {
         try {
           const cached = fs.readFileSync(cacheKey, 'utf8');
+          setCachedResponse(targetPath, { body: cached, contentType: 'application/json; charset=utf-8' });
           res.writeHead(200, {
             'Content-Type': 'application/json; charset=utf-8',
             'Content-Length': Buffer.byteLength(cached),
-            'X-Cache': 'HIT'
+            'X-Cache': 'HIT-DISK'
           });
           return res.end(cached);
         } catch (_) {}
       }
 
+      // 2. In-flight promise deduplication
+      let upstreamPromise = INFLIGHT_REQUESTS.get(targetPath);
+      if (!upstreamPromise) {
+        upstreamPromise = (async () => {
+          let up;
+          try {
+            up = await fetchUpstream(targetPath);
+            if (up.status === 401 || up.status === 403 || up.status >= 500) {
+              rotateToken();
+              up = await fetchUpstream(targetPath);
+            }
+          } catch (err) {
+            rotateToken();
+            try {
+              up = await fetchUpstream(targetPath);
+            } catch (e2) {
+              up = {
+                status: 503,
+                headers: { 'content-type': 'application/json; charset=utf-8' },
+                body: JSON.stringify({ success: false, available: false, error: 'Upstream server busy. Please retry.' })
+              };
+            }
+          }
+          return up;
+        })().finally(() => {
+          INFLIGHT_REQUESTS.delete(targetPath);
+        });
+        INFLIGHT_REQUESTS.set(targetPath, upstreamPromise);
+      }
+
       let upstream;
       try {
-        upstream = await fetchUpstream(targetPath);
-        if (upstream.status === 401 || upstream.status === 403 || upstream.status >= 500) {
-          rotateToken();
-          upstream = await fetchUpstream(targetPath);
-        }
+        upstream = await upstreamPromise;
       } catch (err) {
-        rotateToken();
-        try {
-          upstream = await fetchUpstream(targetPath);
-        } catch (e) {
-          upstream = {
-            status: 200,
-            headers: { 'content-type': 'application/json; charset=utf-8' },
-            body: JSON.stringify({ success: false, available: false, error: 'Upstream server busy. Please retry.' })
-          };
-        }
+        upstream = {
+          status: 503,
+          headers: { 'content-type': 'application/json; charset=utf-8' },
+          body: JSON.stringify({ success: false, available: false, error: 'Upstream connection error.' })
+        };
       }
 
       // If video-details returned error from KGS/RWA (e.g. pending live class or recording not uploaded)
@@ -502,10 +560,20 @@ const server = http.createServer(async (req, res) => {
       }
 
       if (upstream.status >= 200 && upstream.status < 300) {
-        try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
+        try {
+          const parsed = JSON.parse(upstream.body);
+          if (parsed && parsed.success !== false && !parsed.error) {
+            const ttl = targetPath.includes('/batches') ? 1800000 : 900000;
+            setCachedResponse(targetPath, {
+              body: upstream.body,
+              contentType: upstream.headers['content-type'] || 'application/json; charset=utf-8'
+            }, ttl);
+            try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
+          }
+        } catch (_) {}
       }
 
-      res.writeHead(upstream.status >= 400 ? 200 : upstream.status, {
+      res.writeHead(upstream.status, {
         'Content-Type': upstream.headers['content-type'] || 'application/json; charset=utf-8',
         'Content-Length': Buffer.byteLength(upstream.body),
         'X-Cache': 'MISS'
