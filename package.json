@@ -1,0 +1,10 @@
+{
+  "name": "nainoxhrry-backend",
+  "version": "1.0.0",
+  "description": "Dedicated ultra-fast backend for Nainoxhrry Flutter app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {}
+}
