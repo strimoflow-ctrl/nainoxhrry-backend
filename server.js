@@ -274,6 +274,20 @@ const server = http.createServer(async (req, res) => {
       return jsonResponse({ success: true, platforms: PLATFORMS });
     }
 
+    // 1b. Cache Purge (Removes stale RAM & Disk cache)
+    if (pathname === '/api/cache/clear') {
+      MEMORY_CACHE.clear();
+      try {
+        const files = fs.readdirSync(CACHE_DIR);
+        for (const f of files) {
+          if (f.endsWith('.json')) {
+            try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch (_) {}
+          }
+        }
+      } catch (_) {}
+      return jsonResponse({ success: true, message: 'RAM and Disk caches cleared completely' });
+    }
+
     // 2a. Ultra-Fast In-App PDF Proxy (eliminates CORS & Frame blocking for all platforms)
     if (pathname === '/api/pdf-proxy') {
       const pdfTarget = query.get('url');
@@ -416,14 +430,39 @@ const server = http.createServer(async (req, res) => {
               let text = Buffer.concat(bodyChunks).toString('utf8');
               const baseDir = targetUrlStr.substring(0, targetUrlStr.lastIndexOf('/') + 1);
               const lines = text.split('\n');
+              const proto = req.headers['x-forwarded-proto'] || 'https';
+              const host = req.headers['x-forwarded-host'] || req.headers['host'] || 'nainoxhrry-backend-production.up.railway.app';
+              const proxyBase = `${proto}://${host}`;
+
+              let parentQuery = '';
+              try {
+                parentQuery = new URL(targetUrlStr).search;
+              } catch (_) {}
+
               const rewritten = lines.map(line => {
                 const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('#')) return line;
+                if (!trimmed) return line;
+                if (trimmed.startsWith('#')) {
+                  // Rewrite AES-128 key URI so ExoPlayer on Android can fetch encryption key with proxy headers
+                  if (trimmed.includes('URI=')) {
+                    return line.replace(/URI=["']([^"']+)["']/, (match, uri) => {
+                      let keyUrl = uri;
+                      if (!keyUrl.startsWith('http://') && !keyUrl.startsWith('https://')) {
+                        keyUrl = baseDir + keyUrl;
+                      }
+                      return `URI="${proxyBase}/hls?url=${encodeURIComponent(keyUrl)}&referer=${encodeURIComponent(refererStr)}"`;
+                    });
+                  }
+                  return line;
+                }
                 let segmentUrl = trimmed;
                 if (!segmentUrl.startsWith('http://') && !segmentUrl.startsWith('https://')) {
                   segmentUrl = baseDir + segmentUrl;
                 }
-                return `/hls?url=${encodeURIComponent(segmentUrl)}&referer=${encodeURIComponent(refererStr)}`;
+                if (parentQuery && !segmentUrl.includes('?')) {
+                  segmentUrl += parentQuery;
+                }
+                return `${proxyBase}/hls?url=${encodeURIComponent(segmentUrl)}&referer=${encodeURIComponent(refererStr)}`;
               }).join('\n');
 
               const outBuf = Buffer.from(rewritten, 'utf8');
@@ -476,34 +515,46 @@ const server = http.createServer(async (req, res) => {
       } else if (pathname.startsWith('/tbv2/series')) {
         targetPath = '/testbook/series';
       }
-      // 1. Check ultra-fast RAM cache first (0.01ms response)
-      const ramCached = getCachedResponse(targetPath);
-      if (ramCached) {
-        res.writeHead(200, {
-          'Content-Type': ramCached.contentType || 'application/json; charset=utf-8',
-          'Content-Length': Buffer.byteLength(ramCached.body),
-          'X-Cache': 'HIT-RAM'
-        });
-        return res.end(ramCached.body);
+
+      const isNoCache = query.get('nocache') === '1' || query.get('refresh') === '1';
+      const isVideoDetails = pathname.includes('/video-details');
+
+      // 1. Check ultra-fast RAM cache (never cache video-details with short-lived tokens on disk)
+      if (!isNoCache && !isVideoDetails) {
+        const ramCached = getCachedResponse(targetPath);
+        if (ramCached) {
+          res.writeHead(200, {
+            'Content-Type': ramCached.contentType || 'application/json; charset=utf-8',
+            'Content-Length': Buffer.byteLength(ramCached.body),
+            'X-Cache': 'HIT-RAM'
+          });
+          return res.end(ramCached.body);
+        }
       }
 
       const safeKey = targetPath.replace(/[^a-zA-Z0-9_-]/g, '_');
       const cacheKey = path.join(CACHE_DIR, `${safeKey}.json`);
 
-      if (fs.existsSync(cacheKey)) {
+      // 2. Check Disk Cache (only for batches/directories, NEVER for video-details)
+      if (!isNoCache && !isVideoDetails && fs.existsSync(cacheKey)) {
         try {
           const cached = fs.readFileSync(cacheKey, 'utf8');
-          setCachedResponse(targetPath, { body: cached, contentType: 'application/json; charset=utf-8' });
-          res.writeHead(200, {
-            'Content-Type': 'application/json; charset=utf-8',
-            'Content-Length': Buffer.byteLength(cached),
-            'X-Cache': 'HIT-DISK'
-          });
-          return res.end(cached);
+          const parsedCache = JSON.parse(cached);
+          // Don't serve empty batches from cache!
+          const isEmpty = targetPath.includes('/batches') && Array.isArray(parsedCache.batches) && parsedCache.batches.length === 0;
+          if (!isEmpty) {
+            setCachedResponse(targetPath, { body: cached, contentType: 'application/json; charset=utf-8' });
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Content-Length': Buffer.byteLength(cached),
+              'X-Cache': 'HIT-DISK'
+            });
+            return res.end(cached);
+          }
         } catch (_) {}
       }
 
-      // 2. In-flight promise deduplication
+      // 3. In-flight promise deduplication
       let upstreamPromise = INFLIGHT_REQUESTS.get(targetPath);
       if (!upstreamPromise) {
         upstreamPromise = (async () => {
@@ -513,6 +564,16 @@ const server = http.createServer(async (req, res) => {
             if (up.status === 401 || up.status === 403 || up.status >= 500) {
               rotateToken();
               up = await fetchUpstream(targetPath);
+            }
+            // Auto-retry if upstream returned empty batches on first attempt
+            if (targetPath.includes('/batches')) {
+              try {
+                const chk = JSON.parse(up.body);
+                if (chk && Array.isArray(chk.batches) && chk.batches.length === 0) {
+                  rotateToken();
+                  up = await fetchUpstream(targetPath);
+                }
+              } catch (_) {}
             }
           } catch (err) {
             rotateToken();
@@ -563,12 +624,21 @@ const server = http.createServer(async (req, res) => {
         try {
           const parsed = JSON.parse(upstream.body);
           if (parsed && parsed.success !== false && !parsed.error) {
-            const ttl = targetPath.includes('/batches') ? 1800000 : 900000;
-            setCachedResponse(targetPath, {
-              body: upstream.body,
-              contentType: upstream.headers['content-type'] || 'application/json; charset=utf-8'
-            }, ttl);
-            try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
+            const isEmptyBatches = targetPath.includes('/batches') && Array.isArray(parsed.batches) && parsed.batches.length === 0;
+            if (isVideoDetails) {
+              // Cache video-details in RAM for ONLY 60 seconds (prevents expired CloudFront/Edge tokens)
+              setCachedResponse(targetPath, {
+                body: upstream.body,
+                contentType: upstream.headers['content-type'] || 'application/json; charset=utf-8'
+              }, 60000);
+            } else if (!isEmptyBatches) {
+              const ttl = targetPath.includes('/batches') ? 1800000 : 900000;
+              setCachedResponse(targetPath, {
+                body: upstream.body,
+                contentType: upstream.headers['content-type'] || 'application/json; charset=utf-8'
+              }, ttl);
+              try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
+            }
           }
         } catch (_) {}
       }
