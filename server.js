@@ -382,7 +382,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     // 2. High-Speed HLS Stream & Segment Proxy with Referer Injector (For RWA & ClassX)
-    if (pathname === '/hls' || pathname === '/proxy') {
+    if (pathname === '/hls' || pathname === '/proxy' || pathname === '/hls.m3u8' || pathname.startsWith('/hls/')) {
       const targetUrlStr = query.get('url');
       const refererStr = query.get('referer') || 'https://rwa-web.classx.co.in/';
 
@@ -422,7 +422,7 @@ const server = http.createServer(async (req, res) => {
           resHeaders['access-control-allow-headers'] = '*';
           resHeaders['cross-origin-resource-policy'] = 'cross-origin';
 
-          const isM3u8 = (resHeaders['content-type'] || '').includes('mpegurl') || targetUrlStr.includes('.m3u8');
+          const isM3u8 = (resHeaders['content-type'] || '').includes('mpegurl') || targetUrlStr.includes('.m3u8') || pathname.endsWith('.m3u8');
           if (isM3u8) {
             const bodyChunks = [];
             proxyRes.on('data', chunk => bodyChunks.push(chunk));
@@ -450,7 +450,7 @@ const server = http.createServer(async (req, res) => {
                       if (!keyUrl.startsWith('http://') && !keyUrl.startsWith('https://')) {
                         keyUrl = baseDir + keyUrl;
                       }
-                      return `URI="${proxyBase}/hls?url=${encodeURIComponent(keyUrl)}&referer=${encodeURIComponent(refererStr)}"`;
+                      return `URI="${proxyBase}/hls.m3u8?url=${encodeURIComponent(keyUrl)}&referer=${encodeURIComponent(refererStr)}"`;
                     });
                   }
                   return line;
@@ -462,7 +462,8 @@ const server = http.createServer(async (req, res) => {
                 if (parentQuery && !segmentUrl.includes('?')) {
                   segmentUrl += parentQuery;
                 }
-                return `${proxyBase}/hls?url=${encodeURIComponent(segmentUrl)}&referer=${encodeURIComponent(refererStr)}`;
+                const routeName = segmentUrl.includes('.m3u8') ? 'hls.m3u8' : 'hls';
+                return `${proxyBase}/${routeName}?url=${encodeURIComponent(segmentUrl)}&referer=${encodeURIComponent(refererStr)}`;
               }).join('\n');
 
               const outBuf = Buffer.from(rewritten, 'utf8');
