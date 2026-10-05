@@ -10,7 +10,7 @@ const CACHE_DIR = path.join(ROOT, 'cache');
 const WEB_DIST = path.join(ROOT, '..', 'build', 'web');
 
 if (!fs.existsSync(CACHE_DIR)) {
-  try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch (_) {}
+  try { fs.mkdirSync(CACHE_DIR, { recursive: true }); } catch (_) { }
 }
 
 const httpsAgent = new https.Agent({
@@ -60,7 +60,7 @@ function loadTokens() {
       if (Array.isArray(data.tokens) && data.tokens.length > 0) {
         tokenPool = data.tokens.map(t => typeof t === 'string' ? t : t.token).filter(Boolean);
       }
-    } catch (_) {}
+    } catch (_) { }
   }
 }
 loadTokens();
@@ -311,10 +311,10 @@ const server = http.createServer(async (req, res) => {
         const files = fs.readdirSync(CACHE_DIR);
         for (const f of files) {
           if (f.endsWith('.json')) {
-            try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch (_) {}
+            try { fs.unlinkSync(path.join(CACHE_DIR, f)); } catch (_) { }
           }
         }
-      } catch (_) {}
+      } catch (_) { }
       return jsonResponse({ success: true, message: 'RAM and Disk caches cleared completely' });
     }
 
@@ -471,7 +471,7 @@ const server = http.createServer(async (req, res) => {
               let parentQuery = '';
               try {
                 parentQuery = new URL(targetUrlStr).search;
-              } catch (_) {}
+              } catch (_) { }
 
               const rewritten = lines.map(line => {
                 const trimmed = line.trim();
@@ -586,7 +586,7 @@ const server = http.createServer(async (req, res) => {
             });
             return res.end(cached);
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       // 3. In-flight promise deduplication
@@ -600,15 +600,20 @@ const server = http.createServer(async (req, res) => {
               rotateToken();
               up = await fetchUpstream(targetPath);
             }
-            // Auto-retry if upstream returned empty batches on first attempt
+            // Auto-retry across all tokens if upstream returned empty batches
             if (targetPath.includes('/batches')) {
-              try {
-                const chk = JSON.parse(up.body);
-                if (chk && Array.isArray(chk.batches) && chk.batches.length === 0) {
-                  rotateToken();
-                  up = await fetchUpstream(targetPath);
-                }
-              } catch (_) {}
+              let attempts = 0;
+              while (attempts < tokenPool.length) {
+                try {
+                  const chk = JSON.parse(up.body);
+                  if (chk && Array.isArray(chk.batches) && chk.batches.length > 0) {
+                    break;
+                  }
+                } catch (_) { }
+                rotateToken();
+                up = await fetchUpstream(targetPath);
+                attempts++;
+              }
             }
           } catch (err) {
             rotateToken();
@@ -672,10 +677,10 @@ const server = http.createServer(async (req, res) => {
                 body: upstream.body,
                 contentType: upstream.headers['content-type'] || 'application/json; charset=utf-8'
               }, ttl);
-              try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
+              try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) { }
             }
           }
-        } catch (_) {}
+        } catch (_) { }
       }
 
       // Upstream failed or returned error: fallback to disk cache if available
@@ -692,7 +697,26 @@ const server = http.createServer(async (req, res) => {
             });
             return res.end(cached);
           }
-        } catch (_) {}
+        } catch (_) { }
+      }
+
+      // Zero-Batches Protection: If upstream responded with 0 batches, serve non-empty disk cache
+      if (targetPath.includes('/batches') && fs.existsSync(cacheKey)) {
+        try {
+          const parsedUp = JSON.parse(upstream.body);
+          if (parsedUp && Array.isArray(parsedUp.batches) && parsedUp.batches.length === 0) {
+            const cached = fs.readFileSync(cacheKey, 'utf8');
+            const parsedCache = JSON.parse(cached);
+            if (parsedCache && Array.isArray(parsedCache.batches) && parsedCache.batches.length > 0) {
+              res.writeHead(200, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Content-Length': Buffer.byteLength(cached),
+                'X-Cache': 'SAVED-FROM-ZERO-BATCHES'
+              });
+              return res.end(cached);
+            }
+          }
+        } catch (_) { }
       }
 
       res.writeHead(upstream.status, {
