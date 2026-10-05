@@ -74,34 +74,20 @@ function rotateToken() {
   return getActiveToken();
 }
 
-const crypto = require('crypto');
-const STUDYKING_SECRET = 'StudyKingOnTestSharedSecret2026';
-const SPIDY_VAULT_KEY = 'd7c134aa264366862a18302575d1d787b09f075797da89f57ec8c0fc';
-
 function fetchUpstream(upstreamPath) {
   return new Promise((resolve, reject) => {
     const targetUrl = new URL(`https://${KOYEB_HOST}${upstreamPath.startsWith('/') ? '' : '/'}${upstreamPath}`);
     const token = getActiveToken();
-    const ts = Math.floor(Date.now() / 1000).toString();
-    const fullPath = targetUrl.pathname + targetUrl.search;
-    
-    // Generate dynamic HMAC signature
-    const hmacSignature = crypto.createHmac('sha256', STUDYKING_SECRET).update(`${fullPath}:${ts}`).digest('hex');
-    const vaultAuth = crypto.createHmac('sha256', SPIDY_VAULT_KEY).update(`${ts}:${fullPath}`).digest('hex');
-
     const req = https.request({
       protocol: targetUrl.protocol,
       hostname: targetUrl.hostname,
       port: 443,
-      path: fullPath,
+      path: targetUrl.pathname + targetUrl.search,
       method: 'GET',
       headers: {
-        'User-Agent': 'OnTest-Android/1.9.0',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Accept': 'application/json, text/plain, */*',
-        'Authorization': 'Bearer ' + token,
-        'x-client-secret': STUDYKING_SECRET,
-        'x-access-key': SPIDY_VAULT_KEY,
-        'x-app-key': SPIDY_VAULT_KEY
+        'Authorization': 'Bearer ' + token
       },
       agent: httpsAgent,
       timeout: 35000
