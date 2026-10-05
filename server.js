@@ -269,9 +269,39 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    // 0. High-Speed Local Logo Delivery with CORS & Caching
+    if (pathname.startsWith('/logos/') || pathname.startsWith('/assets/logos/') || pathname.startsWith('/assets/assets/logos/')) {
+      const fileName = path.basename(pathname);
+      const possiblePaths = [
+        path.join(ROOT, 'assets', 'logos', fileName),
+        path.join(ROOT, '..', 'assets', 'logos', fileName),
+        path.join(ROOT, '..', 'build', 'web', 'assets', 'assets', 'logos', fileName),
+        path.join(ROOT, '..', 'build', 'web', 'logos', fileName)
+      ];
+      for (const p of possiblePaths) {
+        if (fs.existsSync(p) && fs.statSync(p).isFile()) {
+          res.writeHead(200, {
+            'Content-Type': 'image/png',
+            'Access-Control-Allow-Origin': '*',
+            'Access-Control-Allow-Methods': 'GET, OPTIONS',
+            'Cross-Origin-Resource-Policy': 'cross-origin',
+            'Cache-Control': 'public, max-age=2592000'
+          });
+          return fs.createReadStream(p).pipe(res);
+        }
+      }
+    }
+
     // 1. Platforms
     if (pathname === '/api/platforms' || pathname === '/api/edu-platforms') {
-      return jsonResponse({ success: true, platforms: PLATFORMS });
+      const proto = req.headers['x-forwarded-proto'] || 'http';
+      const host = req.headers['host'] || `localhost:${PORT}`;
+      const baseUrl = `${proto}://${host}`;
+      const mapped = PLATFORMS.map(p => ({
+        ...p,
+        logoUrl: `${baseUrl}/logos/${p.id}.png`
+      }));
+      return jsonResponse({ success: true, platforms: mapped });
     }
 
     // 1b. Cache Purge (Removes stale RAM & Disk cache)
@@ -392,9 +422,13 @@ const server = http.createServer(async (req, res) => {
 
       try {
         const targetUrl = new URL(targetUrlStr);
+        let activeReferer = refererStr;
+        if (!activeReferer && (targetUrlStr.includes('studyiq') || targetUrlStr.includes('siq'))) {
+          activeReferer = 'https://www.studyiq.com/';
+        }
         const headers = {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124.0.0.0',
-          'Referer': refererStr
+          'Referer': activeReferer
         };
 
         if (req.headers['range']) {
@@ -640,6 +674,23 @@ const server = http.createServer(async (req, res) => {
               }, ttl);
               try { fs.writeFileSync(cacheKey, upstream.body); } catch (_) {}
             }
+          }
+        } catch (_) {}
+      }
+
+      // Upstream failed or returned error: fallback to disk cache if available
+      if (upstream.status >= 400 && fs.existsSync(cacheKey)) {
+        try {
+          const cached = fs.readFileSync(cacheKey, 'utf8');
+          const parsedCache = JSON.parse(cached);
+          const isEmpty = targetPath.includes('/batches') && Array.isArray(parsedCache.batches) && parsedCache.batches.length === 0;
+          if (!isEmpty) {
+            res.writeHead(200, {
+              'Content-Type': 'application/json; charset=utf-8',
+              'Content-Length': Buffer.byteLength(cached),
+              'X-Cache': 'FALLBACK-DISK'
+            });
+            return res.end(cached);
           }
         } catch (_) {}
       }
