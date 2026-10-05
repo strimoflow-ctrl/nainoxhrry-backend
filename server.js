@@ -101,10 +101,7 @@ function fetchUpstream(upstreamPath) {
         'Authorization': 'Bearer ' + token,
         'x-client-secret': STUDYKING_SECRET,
         'x-access-key': SPIDY_VAULT_KEY,
-        'x-app-key': SPIDY_VAULT_KEY,
-        'x-timestamp': ts,
-        'x-signature': `${ts}:${hmacSignature}`,
-        'x-spidy-vault-auth': `${ts}:${vaultAuth}`
+        'x-app-key': SPIDY_VAULT_KEY
       },
       agent: httpsAgent,
       timeout: 35000
@@ -734,6 +731,12 @@ const server = http.createServer(async (req, res) => {
             }
           }
         } catch (_) { }
+      }
+
+      if (upstream.status >= 400) {
+        const isBatches = targetPath.includes('/batches');
+        const fallbackObj = isBatches ? { success: true, batches: [] } : { success: false, available: false, error: 'Content is updating. Please retry.' };
+        return jsonResponse(fallbackObj, 200);
       }
 
       res.writeHead(upstream.status, {
